@@ -1,46 +1,29 @@
-# FasterTalk Minimal (Stage 1 Only)
+# FasterTalk
 
-A clean, minimal extraction of the original project focused on one goal:
-train and test the stage-1 VQ model on blendshapes.
+A transformer-based VQ-VAE for compressing and reconstructing FLAME facial motion sequences (expression, jaw, global pose, eyelids) from talking-head video data.
 
-## What is included
+## Overview
 
-- `dataset/data_loader_joint_data_batched.py`: minimal chunked dataloader for `.npz` FLAME params
-- `models/stage1.py`: stage-1 VQ autoencoder
-- `config/talkinghead-1kh/stage1.yaml`: training config
-- `main/train_joint_data_vq_bs.py`: minimal training script
-- `main/test_joint_data_vq_bs.ipynb`: minimal test/eval notebook
+Stage 1 trains a `GroupedResidualVQ` autoencoder over per-frame FLAME parameters (58-dim: 50 expression + 3 jaw + 3 global pose + 2 eyelids), producing a discrete motion codebook intended as a backbone for downstream audio-driven talking-head synthesis.
 
-## Install
+## Structure
 
-```bash
-cd /mnt/fastertalk
-pip install -r requirements.txt
-```
+- `models/stage1.py` — VQ autoencoder (transformer encoder/decoder + grouped residual VQ).
+- `dataset/` — joint FLAME parameter dataloader with augmentations (jitter, dropout, smoothing, resampling, segment masking).
+- `flame_model/` — FLAME mesh model and assets.
+- `renderer/` — mesh rendering utilities.
+- `losses.py` — per-group reconstruction + quantization losses.
+- `config/talkinghead-1kh/stage1.yaml` — training config.
+- `main/train_joint_data_vq_bs.py` — stage 1 training entry point.
 
 ## Train
 
 ```bash
-cd /mnt/fastertalk
 python main/train_joint_data_vq_bs.py --config config/talkinghead-1kh/stage1.yaml
 ```
 
-Checkpoints are saved under `save_path` from the config.
+Checkpoints and metrics are written under `logs/stage1/`.
 
-## Test (Notebook)
+## Requirements
 
-Open:
-
-- `main/test_joint_data_vq_bs.ipynb`
-
-Run all cells. The notebook:
-
-- loads config
-- loads the latest checkpoint from `save_path` (if available)
-- runs one test batch
-- prints reconstruction metrics
-
-## Notes
-
-- This version intentionally removes distributed training, W&B, rendering, and stage-2 logic.
-- It does not modify the original `/mnt/fasttalk` project.
+See [requirements.txt](requirements.txt).
