@@ -1,0 +1,10 @@
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
+numpy==2.2.6
+opencv-python==4.11.0.86
+PyYAML==6.0.2
+tqdm==4.67.1
+wandb==0.21.0
+vector-quantize-pytorch==1.22.17
+pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git@3aee2a6005cbf32275d705b4440deb3813f6a71e
