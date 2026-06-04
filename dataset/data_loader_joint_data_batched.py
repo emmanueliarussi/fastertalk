@@ -1,4 +1,5 @@
 import os
+import random
 from pathlib import Path
 
 import numpy as np
@@ -239,5 +240,100 @@ def get_dataloaders(args):
             num_workers=workers,
             drop_last=False,
             collate_fn=collate_fn,
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Paired (content, style) dataloader for the stage1_style training script.
+#
+# Each batch yields two independent clips per sample: (A, B). Each pad-group is
+# padded independently to its own max length so masks are tight. The simplest
+# approach is to take a batch of size N from the underlying dataset and pair it
+# with a permuted copy of itself; this halves dataset-IO vs sampling 2N items.
+# ---------------------------------------------------------------------------
+
+
+def _pack(items):
+    """Pack a list of (input, target) into padded tensors + bool mask."""
+    inputs = [it[0] for it in items]
+    targets = [it[1] for it in items]
+    lengths = [t.shape[0] for t in inputs]
+    padded_in = pad_sequence(inputs, batch_first=True, padding_value=0.0)
+    padded_tgt = pad_sequence(targets, batch_first=True, padding_value=0.0)
+    mask = torch.zeros(padded_in.shape[:2], dtype=torch.bool)
+    for i, L in enumerate(lengths):
+        mask[i, :L] = True
+    return padded_in, padded_tgt, mask
+
+
+def paired_collate_fn(batch):
+    """Collate that yields (A_in, A_tgt, A_mask, B_in, B_tgt, B_mask).
+
+    A is the original batch order (content side). B is a permutation of the
+    same batch (style side). We try to avoid self-pairing so each sample sees
+    a different clip as its style reference.
+    """
+    n = len(batch)
+    perm = list(range(n))
+    if n > 1:
+        for _ in range(8):
+            random.shuffle(perm)
+            if all(p != i for i, p in enumerate(perm)):
+                break
+        else:  # fall back to a single-step rotation
+            perm = list(range(1, n)) + [0]
+
+    A = [batch[i] for i in range(n)]
+    B = [batch[perm[i]] for i in range(n)]
+
+    A_in, A_tgt, A_mask = _pack(A)
+    B_in, B_tgt, B_mask = _pack(B)
+    return A_in, A_tgt, A_mask, B_in, B_tgt, B_mask
+
+
+def get_paired_dataloaders(args):
+    """Same dataset as :func:`get_dataloaders` but with paired-collate."""
+    train_items, valid_items, test_items = read_data(args)
+
+    train_augmentor = build_augmentor_from_cfg(args)
+    if train_augmentor is not None:
+        print("Data augmentation enabled for training (input-only corruption).")
+    else:
+        print("Data augmentation disabled.")
+
+    datasets = {
+        "train": BlendshapeDataset(train_items, augmentor=train_augmentor),
+        "valid": BlendshapeDataset(valid_items, augmentor=None),
+        "test": BlendshapeDataset(test_items, augmentor=None),
+    }
+
+    workers = int(getattr(args, "workers", 4))
+    batch_size = int(getattr(args, "batch_size", 8))
+
+    return {
+        "train": data.DataLoader(
+            datasets["train"],
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=workers,
+            drop_last=True,
+            collate_fn=paired_collate_fn,
+        ),
+        "valid": data.DataLoader(
+            datasets["valid"],
+            batch_size=max(2, min(batch_size, 4)),
+            shuffle=True,  # need >=2 distinct clips per batch to form pairs
+            num_workers=workers,
+            drop_last=True,
+            collate_fn=paired_collate_fn,
+        ),
+        "test": data.DataLoader(
+            datasets["test"],
+            batch_size=max(2, min(batch_size, 4)),
+            shuffle=False,
+            num_workers=workers,
+            drop_last=True,
+            collate_fn=paired_collate_fn,
         ),
     }

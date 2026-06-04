@@ -1,0 +1,72 @@
+DATA:
+  dataset: TalkingHead-1KH
+  data_root: /mnt/Datasets/ARTalk_data
+  vertices_path: npz
+  read_audio: false
+  train_subjects: English
+  val_subjects: English
+  test_subjects: English
+  max_seq_len: 600
+  min_seq_len: 8
+
+LOSS:
+  quant_loss_weight: 1.0
+  # Per-group reconstruction weights. Each group's MSE is averaged over its own
+  # dims first, so weights compare apples-to-apples regardless of dim count
+  # (expr=50 dims, gpose=3, jaw=3, eyelids=2). Set a weight to 0 to disable.
+  recon_w_expr: 1.0
+  recon_w_gpose: 5.0
+  recon_w_jaw: 2.0
+  recon_w_eyelids: 1.0
+
+NETWORK:
+  arch: stage1_style
+  in_dim: 58
+  hidden_size: 512
+  num_hidden_layers: 6
+  num_attention_heads: 8
+
+VQuantizer:
+  n_embed: 2048
+
+TRAIN:
+  workers: 4
+  batch_size: 8
+  base_lr: 0.0001 
+  epochs: 300
+  step_size: 50
+  gamma: 0.5
+  manual_seed: 131
+  print_freq: 10
+  save_freq: 10
+  save_path: /mnt/fastertalk/logs/stage1_style/checkpoints
+  log_dir: /mnt/fastertalk/logs/stage1_style
+  wandb: true
+  wandb_project: fastertalk_styled
+  wandb_run_name: fastertalk-stage1-scratch
+  wandb_mode: online
+  resume: false
+  evaluate: true
+  eval_freq: 10
+
+AUGMENT:
+  augment: true
+  jitter_prob: 0.7
+  jitter_std_expr: 0.010
+  jitter_std_jaw: 0.006
+  jitter_std_gpose: 0.003
+  dropout_prob: 0.5
+  dropout_ratio: 0.10
+  smooth_prob: 0.4
+  smooth_window_min: 8
+  smooth_window_max: 24
+  smooth_segment_min: 8
+  smooth_segment_max: 32
+  resample_prob: 0.25
+  resample_min: 0.95
+  resample_max: 1.05
+  segmask_prob: 0.4
+  segmask_n_min: 1
+  segmask_n_max: 3
+  segmask_len_min: 2
+  segmask_len_max: 6
