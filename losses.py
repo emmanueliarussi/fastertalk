@@ -22,6 +22,19 @@ def _masked_group_mse(pred, target, mask, group_slice):
     return (sq * m).sum() / denom
 
 
+def masked_latent_mse(a, b, mask):
+    """MSE between two latent sequences [B, T, D], averaged over valid timesteps.
+
+    Used for the content / code-preservation anchor: re-encode the style-swapped
+    decode and require its continuous encoder latent to match the original
+    content latent (so swapping style does not change *what* is being said).
+    """
+    m = mask.unsqueeze(-1).float()           # [B, T, 1]
+    sq = (a - b) ** 2
+    denom = torch.clamp(m.sum() * a.shape[-1], min=1.0)
+    return (sq * m).sum() / denom
+
+
 def masked_grouped_recon(pred, target, mask, w_expr=1.0, w_gpose=5.0, w_jaw=2.0, w_eyelids=1.0):
     """Group-weighted reconstruction loss.
 

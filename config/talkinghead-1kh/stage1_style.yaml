@@ -18,6 +18,16 @@ LOSS:
   recon_w_gpose: 5.0
   recon_w_jaw: 2.0
   recon_w_eyelids: 1.0
+  # --- Style conditioning (swap) losses ---
+  # Style-consistency: decode the same content codes with another clip's style
+  # and require the FLAME-measured style of the output to match the requested
+  # style. Code-preservation: re-encode that swapped decode and keep its content
+  # latent equal to the original (so style changes expressiveness, not content).
+  # These act in z-scored / latent space (~O(1)), much larger than the tiny
+  # reconstruction MSE (~1e-3), so weights are kept small. Tune as needed.
+  style_consistency_weight: 0.1
+  code_preservation_weight: 0.1
+  style_warmup_epochs: 20      # linear 0->1 ramp so reconstruction stabilizes first
 
 NETWORK:
   arch: stage1_style
@@ -25,6 +35,8 @@ NETWORK:
   hidden_size: 512
   num_hidden_layers: 6
   num_attention_heads: 8
+  style_dim: 32
+  n_style_scalars: 6  # N_REGIONS(3) x N_FEATURES(2): lips_disp, lips_speed, forehead_disp, forehead_speed, eyes_disp, eyes_speed
 
 VQuantizer:
   n_embed: 2048

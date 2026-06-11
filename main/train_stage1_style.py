@@ -15,7 +15,8 @@ import torch
 from torch.optim.lr_scheduler import StepLR
 
 from dataset.data_loader_joint_data_batched import get_dataloaders
-from losses import calc_vq_loss
+from dataset.style_measure import StyleMeasurer
+from losses import calc_vq_loss, masked_latent_mse
 from models import get_model
 from utils.config import load_flat_config
 
@@ -63,7 +64,7 @@ def save_checkpoint(model, optimizer, epoch, out_dir):
     print(f"Saved checkpoint: {ckpt_path}")
 
 
-def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, train_mode=True):
+def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, measurer=None, train_mode=True):
     if train_mode:
         model.train()
     else:
@@ -73,6 +74,8 @@ def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, train_mode=T
     data_time = AverageMeter()
     recon_total = 0.0
     quant_total = 0.0
+    style_total = 0.0
+    code_total = 0.0
     parts_total = {"recon_expr": 0.0, "recon_gpose": 0.0, "recon_jaw": 0.0, "recon_eyelids": 0.0}
     n_steps = 0
     end = time.time()
@@ -83,6 +86,14 @@ def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, train_mode=T
     w_jaw = float(getattr(cfg, "recon_w_jaw", 2.0))
     w_eyelids = float(getattr(cfg, "recon_w_eyelids", 1.0))
 
+    # Style-conditioning losses (only active when a measurer is supplied).
+    w_style = float(getattr(cfg, "style_consistency_weight", 0.1))
+    w_code = float(getattr(cfg, "code_preservation_weight", 0.1))
+    warmup = int(getattr(cfg, "style_warmup_epochs", 0))
+    # Linear ramp 0 -> 1 over `warmup` epochs so reconstruction stabilizes first.
+    ramp = 1.0 if warmup <= 0 else min(1.0, float(epoch) / float(warmup))
+    use_swap = measurer is not None
+
     if train_mode:
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"----> Total trainable parameters: {trainable_params}")
@@ -91,14 +102,17 @@ def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, train_mode=T
         current_iter = (int(epoch) - 1) * len(loader) + step
         data_time.update(time.time() - end)
 
-        # New dataset returns (input, target, mask). Input may be augmented; target is clean.
-        blendshapes_in, blendshapes_tgt, mask = batch
+        # New dataset returns (input, target, mask, style). Input may be augmented; target is clean.
+        blendshapes_in, blendshapes_tgt, mask, style = batch
         blendshapes_in = blendshapes_in.to(device)
         blendshapes_tgt = blendshapes_tgt.to(device)
         mask = mask.to(device)
+        style = style.to(device)
 
         with torch.set_grad_enabled(train_mode):
-            pred, q_loss = model(blendshapes_in, mask)
+            # --- Matched (AA) branch: encode content, decode with its own style ---
+            z, quantized, q_loss = model.encode(blendshapes_in, mask)
+            pred = model.decode(quantized, mask, style=style)
             loss, details = calc_vq_loss(
                 pred,
                 blendshapes_tgt,
@@ -111,6 +125,27 @@ def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, train_mode=T
                 w_eyelids=w_eyelids,
             )
 
+            style_loss_val = 0.0
+            code_loss_val = 0.0
+            if use_swap:
+                # --- Swap (AB) branch: same content codes, a different clip's style ---
+                style_swap = torch.roll(style, shifts=1, dims=0)
+                pred_swap = model.decode(quantized, mask, style=style_swap)
+
+                # Style-consistency: the decoded output must actually exhibit the
+                # requested (swapped) style, measured by the differentiable FLAME metric.
+                measured = measurer(pred_swap, mask)            # [B, 6]
+                style_loss = torch.nn.functional.mse_loss(measured, style_swap)
+
+                # Code-preservation anchor: re-encode the swapped decode (continuous,
+                # no VQ EMA update) and require its content latent to match A's.
+                z_swap = model.encode_continuous(pred_swap, mask)
+                code_loss = masked_latent_mse(z_swap, z.detach(), mask)
+
+                loss = loss + ramp * (w_style * style_loss + w_code * code_loss)
+                style_loss_val = float(style_loss.item())
+                code_loss_val = float(code_loss.item())
+
             if train_mode:
                 optimizer.zero_grad()
                 loss.backward()
@@ -122,6 +157,8 @@ def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, train_mode=T
 
         recon_total += float(details["recon"].item())
         quant_total += float(details["quant"].item())
+        style_total += style_loss_val
+        code_total += code_loss_val
         for k in parts_total:
             if k in details:
                 parts_total[k] += float(details[k].item())
@@ -140,15 +177,19 @@ def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, train_mode=T
                 f"Batch: {batch_time.val:.3f} ({batch_time.avg:.3f}) "
                 f"Remain: {remain_time_str} "
                 f"Grad norm: {grad_norm_first_layer:.4f} "
-                f"Loss blendshapes: {details['recon'].item():.4f}"
+                f"Loss blendshapes: {details['recon'].item():.4f} "
+                f"style: {style_loss_val:.4f} code: {code_loss_val:.4f}"
             )
 
     if n_steps == 0:
-        return {"recon": 0.0, "quant": 0.0, "recon_expr": 0.0, "recon_gpose": 0.0, "recon_jaw": 0.0, "recon_eyelids": 0.0}
+        return {"recon": 0.0, "quant": 0.0, "style": 0.0, "code": 0.0,
+                "recon_expr": 0.0, "recon_gpose": 0.0, "recon_jaw": 0.0, "recon_eyelids": 0.0}
 
     return {
         "recon": recon_total / n_steps,
         "quant": quant_total / n_steps,
+        "style": style_total / n_steps,
+        "code": code_total / n_steps,
         "recon_expr": parts_total["recon_expr"] / n_steps,
         "recon_gpose": parts_total["recon_gpose"] / n_steps,
         "recon_jaw": parts_total["recon_jaw"] / n_steps,
@@ -219,6 +260,16 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.base_lr))
     scheduler = StepLR(optimizer, step_size=int(cfg.step_size), gamma=float(cfg.gamma))
 
+    # Differentiable in-loop style metric for the style-consistency / swap loss.
+    measurer = None
+    if bool(getattr(cfg, "use_style_swap", True)):
+        stats_path = Path(getattr(cfg, "data_root")) / "annotations" / "style_disp_stats.npz"
+        if stats_path.exists():
+            measurer = StyleMeasurer(stats_path).to(device)
+            print(f"Style swap enabled. Measurer loaded from {stats_path}")
+        else:
+            print(f"WARNING: style stats not found at {stats_path}; style swap disabled.")
+
     save_root = Path(cfg.save_path)
     save_root.mkdir(parents=True, exist_ok=True)
     log_dir = Path(getattr(cfg, "log_dir", save_root.parent))
@@ -235,7 +286,7 @@ def main():
 
     epochs = int(cfg.epochs)
     for epoch in range(start_epoch, epochs + 1):
-        train_metrics = run_epoch(train_loader, model, optimizer, device, cfg, epoch, epochs, train_mode=True)
+        train_metrics = run_epoch(train_loader, model, optimizer, device, cfg, epoch, epochs, measurer=measurer, train_mode=True)
         scheduler.step()
 
         metrics = {
@@ -243,6 +294,8 @@ def main():
             "lr": float(optimizer.param_groups[0]["lr"]),
             "blendshapes_loss_train": train_metrics["recon"],
             "quan_loss_train": train_metrics["quant"],
+            "style_loss_train": train_metrics["style"],
+            "code_loss_train": train_metrics["code"],
             "recon_expr_train": train_metrics["recon_expr"],
             "recon_gpose_train": train_metrics["recon_gpose"],
             "recon_jaw_train": train_metrics["recon_jaw"],
@@ -253,6 +306,8 @@ def main():
             f"[Epoch {epoch:03d}] "
             f"blendshapes_loss_train={metrics['blendshapes_loss_train']:.6f} "
             f"quan_loss_train={metrics['quan_loss_train']:.6f} "
+            f"style_loss_train={metrics['style_loss_train']:.6f} "
+            f"code_loss_train={metrics['code_loss_train']:.6f} "
             f"expr={metrics['recon_expr_train']:.6f} "
             f"gpose={metrics['recon_gpose_train']:.6f} "
             f"jaw={metrics['recon_jaw_train']:.6f} "
@@ -260,9 +315,11 @@ def main():
         )
 
         if bool(getattr(cfg, "evaluate", True)) and epoch % int(cfg.eval_freq) == 0:
-            val_metrics = run_epoch(valid_loader, model, optimizer, device, cfg, epoch, epochs, train_mode=False)
+            val_metrics = run_epoch(valid_loader, model, optimizer, device, cfg, epoch, epochs, measurer=measurer, train_mode=False)
             metrics["blendshapes_loss_val"] = val_metrics["recon"]
             metrics["quan_loss_val"] = val_metrics["quant"]
+            metrics["style_loss_val"] = val_metrics["style"]
+            metrics["code_loss_val"] = val_metrics["code"]
             metrics["recon_expr_val"] = val_metrics["recon_expr"]
             metrics["recon_gpose_val"] = val_metrics["recon_gpose"]
             metrics["recon_jaw_val"] = val_metrics["recon_jaw"]
