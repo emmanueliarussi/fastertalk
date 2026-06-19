@@ -18,6 +18,11 @@ from dataset.data_loader_joint_data_batched import get_dataloaders
 from dataset.style_measure import StyleMeasurer
 from losses import calc_vq_loss, masked_latent_mse
 from models import get_model
+from models.discriminator import (
+    TemporalPatchDiscriminator,
+    disc_hinge_loss,
+    gen_hinge_loss,
+)
 from utils.config import load_flat_config
 
 try:
@@ -64,7 +69,8 @@ def save_checkpoint(model, optimizer, epoch, out_dir):
     print(f"Saved checkpoint: {ckpt_path}")
 
 
-def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, measurer=None, train_mode=True):
+def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, measurer=None,
+              disc=None, disc_optimizer=None, train_mode=True):
     if train_mode:
         model.train()
     else:
@@ -76,6 +82,8 @@ def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, measurer=Non
     quant_total = 0.0
     style_total = 0.0
     code_total = 0.0
+    adv_total = 0.0
+    disc_total = 0.0
     parts_total = {"recon_expr": 0.0, "recon_gpose": 0.0, "recon_jaw": 0.0, "recon_eyelids": 0.0}
     n_steps = 0
     end = time.time()
@@ -93,6 +101,21 @@ def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, measurer=Non
     # Linear ramp 0 -> 1 over `warmup` epochs so reconstruction stabilizes first.
     ramp = 1.0 if warmup <= 0 else min(1.0, float(epoch) / float(warmup))
     use_swap = measurer is not None
+
+    # Realism critic (adversarial) on the swap decode.
+    w_adv = float(getattr(cfg, "adversarial_weight", 0.0))
+    adv_warmup = int(getattr(cfg, "adv_warmup_epochs", 0))
+    adv_ramp = 1.0 if adv_warmup <= 0 else min(1.0, float(epoch) / float(adv_warmup))
+    use_critic = (disc is not None) and use_swap and w_adv > 0
+
+    # Per-dimension weights for the style-consistency loss (6 z-scored scalars:
+    # [lips_disp, lips_speed, forehead_disp, forehead_speed, eyes_disp, eyes_speed]).
+    # Normalized to mean 1 so the overall style-loss scale is unchanged and
+    # style_consistency_weight keeps its meaning.
+    style_dim_w = getattr(cfg, "style_dim_weights", None)
+    if style_dim_w is not None:
+        style_dim_w = torch.as_tensor(style_dim_w, dtype=torch.float32, device=device)
+        style_dim_w = style_dim_w / style_dim_w.mean().clamp(min=1e-8)
 
     if train_mode:
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -127,6 +150,8 @@ def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, measurer=Non
 
             style_loss_val = 0.0
             code_loss_val = 0.0
+            adv_loss_val = 0.0
+            disc_loss_val = 0.0
             if use_swap:
                 # --- Swap (AB) branch: same content codes, a different clip's style ---
                 style_swap = torch.roll(style, shifts=1, dims=0)
@@ -135,7 +160,10 @@ def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, measurer=Non
                 # Style-consistency: the decoded output must actually exhibit the
                 # requested (swapped) style, measured by the differentiable FLAME metric.
                 measured = measurer(pred_swap, mask)            # [B, 6]
-                style_loss = torch.nn.functional.mse_loss(measured, style_swap)
+                if style_dim_w is not None:
+                    style_loss = (style_dim_w * (measured - style_swap) ** 2).mean()
+                else:
+                    style_loss = torch.nn.functional.mse_loss(measured, style_swap)
 
                 # Code-preservation anchor: re-encode the swapped decode (continuous,
                 # no VQ EMA update) and require its content latent to match A's.
@@ -146,11 +174,29 @@ def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, measurer=Non
                 style_loss_val = float(style_loss.item())
                 code_loss_val = float(code_loss.item())
 
+                # Realism critic: the swap decode must also look like real motion,
+                # so the style target can only be met with realistic (sustained /
+                # naturally bursty) dynamics rather than a metric-gaming transient.
+                if use_critic:
+                    g_adv = gen_hinge_loss(disc(pred_swap), mask)
+                    loss = loss + w_adv * adv_ramp * g_adv
+                    adv_loss_val = float(g_adv.item())
+
             if train_mode:
                 optimizer.zero_grad()
                 loss.backward()
                 grad_norm_first_layer = float(model.encoder_proj.weight.grad.norm().item())
                 optimizer.step()
+
+                # --- Discriminator update (separate optimizer, detached fakes) ---
+                if use_critic:
+                    disc_optimizer.zero_grad()
+                    d_real = disc(blendshapes_tgt.detach())
+                    d_fake = disc(pred_swap.detach())
+                    d_loss = disc_hinge_loss(d_real, d_fake, mask)
+                    d_loss.backward()
+                    disc_optimizer.step()
+                    disc_loss_val = float(d_loss.item())
 
         batch_time.update(time.time() - end)
         end = time.time()
@@ -159,6 +205,8 @@ def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, measurer=Non
         quant_total += float(details["quant"].item())
         style_total += style_loss_val
         code_total += code_loss_val
+        adv_total += adv_loss_val
+        disc_total += disc_loss_val
         for k in parts_total:
             if k in details:
                 parts_total[k] += float(details[k].item())
@@ -178,11 +226,12 @@ def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, measurer=Non
                 f"Remain: {remain_time_str} "
                 f"Grad norm: {grad_norm_first_layer:.4f} "
                 f"Loss blendshapes: {details['recon'].item():.4f} "
-                f"style: {style_loss_val:.4f} code: {code_loss_val:.4f}"
+                f"style: {style_loss_val:.4f} code: {code_loss_val:.4f} "
+                f"adv: {adv_loss_val:.4f} disc: {disc_loss_val:.4f}"
             )
 
     if n_steps == 0:
-        return {"recon": 0.0, "quant": 0.0, "style": 0.0, "code": 0.0,
+        return {"recon": 0.0, "quant": 0.0, "style": 0.0, "code": 0.0, "adv": 0.0, "disc": 0.0,
                 "recon_expr": 0.0, "recon_gpose": 0.0, "recon_jaw": 0.0, "recon_eyelids": 0.0}
 
     return {
@@ -190,6 +239,8 @@ def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, measurer=Non
         "quant": quant_total / n_steps,
         "style": style_total / n_steps,
         "code": code_total / n_steps,
+        "adv": adv_total / n_steps,
+        "disc": disc_total / n_steps,
         "recon_expr": parts_total["recon_expr"] / n_steps,
         "recon_gpose": parts_total["recon_gpose"] / n_steps,
         "recon_jaw": parts_total["recon_jaw"] / n_steps,
@@ -270,6 +321,24 @@ def main():
         else:
             print(f"WARNING: style stats not found at {stats_path}; style swap disabled.")
 
+    # Realism critic on the swap decode (adversarial). Active when
+    # adversarial_weight > 0 and the style swap is enabled.
+    disc = None
+    disc_optimizer = None
+    if measurer is not None and float(getattr(cfg, "adversarial_weight", 0.0)) > 0:
+        disc = TemporalPatchDiscriminator(
+            in_dim=int(getattr(cfg, "in_dim", 58)),
+            hidden=int(getattr(cfg, "disc_hidden", 128)),
+            n_layers=int(getattr(cfg, "disc_layers", 4)),
+            kernel=int(getattr(cfg, "disc_kernel", 5)),
+        ).to(device)
+        disc_optimizer = torch.optim.AdamW(
+            disc.parameters(),
+            lr=float(getattr(cfg, "disc_lr", cfg.base_lr)),
+            betas=(0.5, 0.9),
+        )
+        print(f"Realism critic enabled (adversarial_weight={cfg.adversarial_weight}).")
+
     save_root = Path(cfg.save_path)
     save_root.mkdir(parents=True, exist_ok=True)
     log_dir = Path(getattr(cfg, "log_dir", save_root.parent))
@@ -286,7 +355,7 @@ def main():
 
     epochs = int(cfg.epochs)
     for epoch in range(start_epoch, epochs + 1):
-        train_metrics = run_epoch(train_loader, model, optimizer, device, cfg, epoch, epochs, measurer=measurer, train_mode=True)
+        train_metrics = run_epoch(train_loader, model, optimizer, device, cfg, epoch, epochs, measurer=measurer, disc=disc, disc_optimizer=disc_optimizer, train_mode=True)
         scheduler.step()
 
         metrics = {
@@ -296,6 +365,8 @@ def main():
             "quan_loss_train": train_metrics["quant"],
             "style_loss_train": train_metrics["style"],
             "code_loss_train": train_metrics["code"],
+            "adv_loss_train": train_metrics["adv"],
+            "disc_loss_train": train_metrics["disc"],
             "recon_expr_train": train_metrics["recon_expr"],
             "recon_gpose_train": train_metrics["recon_gpose"],
             "recon_jaw_train": train_metrics["recon_jaw"],
@@ -308,6 +379,8 @@ def main():
             f"quan_loss_train={metrics['quan_loss_train']:.6f} "
             f"style_loss_train={metrics['style_loss_train']:.6f} "
             f"code_loss_train={metrics['code_loss_train']:.6f} "
+            f"adv_loss_train={metrics['adv_loss_train']:.6f} "
+            f"disc_loss_train={metrics['disc_loss_train']:.6f} "
             f"expr={metrics['recon_expr_train']:.6f} "
             f"gpose={metrics['recon_gpose_train']:.6f} "
             f"jaw={metrics['recon_jaw_train']:.6f} "
@@ -315,7 +388,7 @@ def main():
         )
 
         if bool(getattr(cfg, "evaluate", True)) and epoch % int(cfg.eval_freq) == 0:
-            val_metrics = run_epoch(valid_loader, model, optimizer, device, cfg, epoch, epochs, measurer=measurer, train_mode=False)
+            val_metrics = run_epoch(valid_loader, model, optimizer, device, cfg, epoch, epochs, measurer=measurer, disc=disc, train_mode=False)
             metrics["blendshapes_loss_val"] = val_metrics["recon"]
             metrics["quan_loss_val"] = val_metrics["quant"]
             metrics["style_loss_val"] = val_metrics["style"]

@@ -28,6 +28,23 @@ LOSS:
   style_consistency_weight: 0.1
   code_preservation_weight: 0.1
   style_warmup_epochs: 20      # linear 0->1 ramp so reconstruction stabilizes first
+  # Per-dimension weights for the style-consistency loss, applied to the 6
+  # z-scored style scalars in order:
+  #   [lips_disp, lips_speed, forehead_disp, forehead_speed, eyes_disp, eyes_speed]
+  # Low-leverage regions (forehead, eyes) and all *_speed dims have a worse
+  # recon-vs-style exchange rate, so up-weight them to force the decoder to honor
+  # the requested style there. Lips already respond strongly -> keep at 1.0.
+  style_dim_weights: [1.0, 2.0, 3.0, 5.0, 3.0, 5.0]
+  # --- Realism critic (adversarial) on the swap decode ---
+  # A temporal PatchGAN judges local motion realism so the style target can only
+  # be met with realistic, sustained/naturally-bursty dynamics rather than a
+  # metric-gaming transient. Set adversarial_weight: 0 to disable.
+  adversarial_weight: 0.05
+  adv_warmup_epochs: 30        # ramp the generator adversarial term in slowly
+  disc_lr: 0.0001
+  disc_hidden: 128
+  disc_layers: 4
+  disc_kernel: 5
 
 NETWORK:
   arch: stage1_style
@@ -37,6 +54,16 @@ NETWORK:
   num_attention_heads: 8
   style_dim: 32
   n_style_scalars: 6  # N_REGIONS(3) x N_FEATURES(2): lips_disp, lips_speed, forehead_disp, forehead_speed, eyes_disp, eyes_speed
+  # Time-varying FiLM: let the style modulation vary across frames (driven by a
+  # content-free positional clock) so it can control the speed/displacement ratio
+  # (motion frequency), not just amplitude. A mild temporal low-pass caps how
+  # spiky the modulation can be (style_film_smooth_win frames; 1 disables it).
+  # REVERTED (A2): time-varying FiLM gamed the clip-level p95 metric by spiking
+  # expressiveness in the first frames then reverting -> broke realism and hurt
+  # speed slopes. Disabled; back to the time-invariant FiLM baseline.
+  style_time_varying: false
+  style_time_dim: 16
+  style_film_smooth_win: 3
 
 VQuantizer:
   n_embed: 2048
