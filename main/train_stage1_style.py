@@ -159,7 +159,7 @@ def run_epoch(loader, model, optimizer, device, cfg, epoch, epochs, measurer=Non
 
                 # Style-consistency: the decoded output must actually exhibit the
                 # requested (swapped) style, measured by the differentiable FLAME metric.
-                measured = measurer(pred_swap, mask)            # [B, 6]
+                measured = measurer(pred_swap, mask)            # [B, n_style_scalars]
                 if style_dim_w is not None:
                     style_loss = (style_dim_w * (measured - style_swap) ** 2).mean()
                 else:

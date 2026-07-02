@@ -10,6 +10,11 @@ from tqdm import tqdm
 
 from dataset.augment import build_augmentor_from_cfg
 
+# Number of vertex-displacement regions (lips, forehead, eyes).  An optional
+# 'pose' region is appended after these when head pose is annotated, so a stats
+# array with more than this many regions carries pose as its last row.
+N_VERTEX_REGIONS = 3
+
 
 class BlendshapeDataset(data.Dataset):
     def __init__(self, items, augmentor=None, style_mean=None, style_std=None):
@@ -40,13 +45,24 @@ class BlendshapeDataset(data.Dataset):
         if disp is not None:
             # disp: (T, N_REGIONS, 2)
             p95 = np.percentile(disp, 95, axis=0)          # (N_REGIONS, 2)
+            # Pose disp = head range of motion: aggregate the precomputed
+            # per-frame excursion as a temporal std (RMS) over the chunk rather
+            # than its p95 tail, which a single brief swing would satisfy.
+            if disp.shape[1] > N_VERTEX_REGIONS:
+                pose_exc = disp[:, N_VERTEX_REGIONS, 0]
+                p95[N_VERTEX_REGIONS, 0] = np.sqrt(np.mean(pose_exc ** 2))
             if self.style_mean is not None and self.style_std is not None:
                 p95 = (p95 - self.style_mean) / self.style_std
             style = torch.from_numpy(p95.flatten().astype(np.float32))  # (N_REGIONS*2,)
         else:
             # No sidecar available: emit zeros (model treats this as "average style"
-            # after z-scoring, since mean≈0).  Shape matches the normal case.
-            n_style = 6  # N_REGIONS * N_FEATURES = 3 * 2
+            # after z-scoring, since mean≈0).  Shape matches the normal case and is
+            # derived from the stats so it stays in sync with the annotated regions
+            # (e.g. 8 = 4 regions x 2 features once 'pose' is included).
+            if self.style_mean is not None:
+                n_style = int(self.style_mean.size)
+            else:
+                n_style = 6
             style = torch.zeros(n_style, dtype=torch.float32)
 
         return (

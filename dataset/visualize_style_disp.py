@@ -2,8 +2,8 @@
 """
 Visualize top examples ranked by per-region style displacement metrics.
 
-For each region (lips, forehead, eyes) and each metric (disp, speed) finds
-the N clips with the highest p95 value and renders them as MP4 videos.
+For each region (lips, forehead, eyes, pose) and each metric (disp, speed)
+finds the N clips with the highest p95 value and renders them as MP4 videos.
 
 Output structure:
   <out_dir>/
@@ -13,6 +13,11 @@ Output structure:
     forehead_speed/
     eyes_disp/
     eyes_speed/
+    pose_disp/      top-N clips ranked by head-rotation magnitude
+    pose_speed/     top-N clips ranked by head-rotation speed
+
+The region list is read from the dataset's style_disp_stats.npz so it stays in
+sync with precompute_style_disp.py (e.g. pose is included only when annotated).
 
 Usage
 -----
@@ -45,11 +50,22 @@ os.chdir(PROJECT_ROOT)
 from flame_model.FLAME import FLAMEModel
 from renderer.renderer import Renderer
 
-# Must match precompute_style_disp.py
-REGION_NAMES  = ["lips", "forehead", "eyes"]
+# Region layout is resolved at runtime from the stats file written by
+# precompute_style_disp.py (so 'pose' appears only when it was annotated).
+# These are the fallbacks used when no stats file is present.
+DEFAULT_REGION_NAMES = ["lips", "forehead", "eyes", "pose"]
 FEATURE_NAMES = ["disp", "speed"]
-N_REGIONS     = len(REGION_NAMES)   # 3
 N_FEATURES    = len(FEATURE_NAMES)  # 2
+
+
+def resolve_region_names(annot_root: Path):
+    """Return the ordered region names from style_disp_stats.npz, or the default."""
+    stats_path = annot_root / "style_disp_stats.npz"
+    if stats_path.exists():
+        stats = np.load(stats_path, allow_pickle=True)
+        if "region_names" in stats.files:
+            return [str(n) for n in stats["region_names"]]
+    return list(DEFAULT_REGION_NAMES)
 
 
 # ---------------------------------------------------------------------------
@@ -154,12 +170,13 @@ def save_video(frames, path: Path, fps: int = 25):
 # Score sidecars
 # ---------------------------------------------------------------------------
 
-def collect_scores(npz_files, npz_root, annot_root):
+def collect_scores(npz_files, npz_root, annot_root, region_names):
     """
     Returns scores[region_idx][feat_idx] = list of (score, npz_path).
     score = p95 of the feature over the full sidecar (all frames).
     """
-    scores = [[[] for _ in FEATURE_NAMES] for _ in REGION_NAMES]
+    n_regions = len(region_names)
+    scores = [[[] for _ in FEATURE_NAMES] for _ in region_names]
 
     for npz_path in npz_files:
         rel     = npz_path.relative_to(npz_root)
@@ -167,11 +184,11 @@ def collect_scores(npz_files, npz_root, annot_root):
         if not sidecar.exists():
             continue
 
-        feats = np.load(sidecar)   # (T, N_REGIONS, 2)
-        if feats.ndim != 3 or feats.shape[1] != N_REGIONS or feats.shape[2] != N_FEATURES:
+        feats = np.load(sidecar)   # (T, n_regions, 2)
+        if feats.ndim != 3 or feats.shape[1] < n_regions or feats.shape[2] != N_FEATURES:
             continue
 
-        for ri in range(N_REGIONS):
+        for ri in range(n_regions):
             for fi in range(N_FEATURES):
                 p95 = float(np.percentile(feats[:, ri, fi], 95))
                 scores[ri][fi].append((p95, npz_path))
@@ -220,19 +237,24 @@ def main():
     npz_files = sorted(npz_root.rglob("*.npz"))
     print(f"Found {len(npz_files)} .npz files")
 
+    # --- Resolve region layout from stats (stays in sync with precompute) ---
+    region_names = resolve_region_names(annot_root)
+    n_regions = len(region_names)
+    print(f"Regions    : {region_names}")
+
     # --- Score ---
     print("Scoring sidecars...")
-    scores = collect_scores(npz_files, npz_root, annot_root)
+    scores = collect_scores(npz_files, npz_root, annot_root, region_names)
 
-    total_scored = sum(len(scores[ri][fi]) for ri in range(N_REGIONS) for fi in range(N_FEATURES))
-    print(f"Scored {total_scored // (N_REGIONS * N_FEATURES)} clips with valid sidecars")
+    total_scored = sum(len(scores[ri][fi]) for ri in range(n_regions) for fi in range(N_FEATURES))
+    print(f"Scored {total_scored // (n_regions * N_FEATURES)} clips with valid sidecars")
 
     if total_scored == 0:
         print("ERROR: no sidecar files found. Run precompute_style_disp.py first.")
         return
 
     # --- Render top-N per region/feature ---
-    for ri, region in enumerate(REGION_NAMES):
+    for ri, region in enumerate(region_names):
         for fi, feat in enumerate(FEATURE_NAMES):
             bucket = sorted(scores[ri][fi], key=lambda x: x[0], reverse=True)
             top    = bucket[: args.top_n]

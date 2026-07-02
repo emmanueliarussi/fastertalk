@@ -34,6 +34,7 @@ from dataset.precompute_style_disp import (
 
 # Channel layout (per timestep, 58 dims total) — matches losses.py / precompute.
 EXPR_SLICE = slice(0, 50)
+GPOSE_SLICE = slice(50, 53)
 JAW_SLICE = slice(53, 56)
 
 
@@ -69,7 +70,8 @@ class StyleMeasurer(nn.Module):
                 neutral = neutral[0]
         self.register_buffer("neutral_verts", neutral.squeeze(0), persistent=False)  # (V, 3)
 
-        # z-score stats written by precompute_style_disp.py, shape (N_REGIONS, 2).
+        # z-score stats written by precompute_style_disp.py, shape (R, 2) where
+        # R = N_REGIONS vertex regions, optionally +1 for a 'pose' region.
         stats = np.load(stats_path)
         self.register_buffer(
             "style_mean", torch.from_numpy(stats["mean"].astype(np.float32)), persistent=False
@@ -78,13 +80,22 @@ class StyleMeasurer(nn.Module):
             "style_std", torch.from_numpy(stats["std"].astype(np.float32)), persistent=False
         )
 
+        # Pose is measured in parameter space from the decoded gpose channels
+        # (||gpose(t)|| and its frame-to-frame change), NOT as vertex
+        # displacement — head rotation rigidly moves the whole mesh.  It is
+        # present iff the stats file carries an extra region row beyond the
+        # vertex regions, matching precompute_style_disp.py --include_pose.
+        self.n_regions = int(self.style_mean.shape[0])
+        self.include_pose = self.n_regions > N_REGIONS
+
     def _region_idx(self, name):
         return getattr(self, f"mask_{name}")
 
     def forward(self, blendshapes, mask=None):
-        """blendshapes: [B, T, 58], mask: [B, T] (bool/0-1) -> style [B, N_REGIONS*2]."""
+        """blendshapes: [B, T, 58], mask: [B, T] (bool/0-1) -> style [B, n_regions*2]."""
         B = blendshapes.shape[0]
         expr = blendshapes[..., EXPR_SLICE]   # [B, T, 50]
+        gpose = blendshapes[..., GPOSE_SLICE] # [B, T, 3]
         jaw = blendshapes[..., JAW_SLICE]     # [B, T, 3]
 
         out = []
@@ -92,14 +103,16 @@ class StyleMeasurer(nn.Module):
             if mask is not None:
                 valid = mask[b].bool()
                 expr_b = expr[b][valid]
+                gpose_b = gpose[b][valid]
                 jaw_b = jaw[b][valid]
             else:
                 expr_b = expr[b]
+                gpose_b = gpose[b]
                 jaw_b = jaw[b]
 
             L = expr_b.shape[0]
             if L < 2:
-                out.append(blendshapes.new_zeros(N_REGIONS * 2))
+                out.append(blendshapes.new_zeros(self.n_regions * 2))
                 continue
 
             # gpose zeroed: only expression + jaw drive the vertices.
@@ -123,10 +136,31 @@ class StyleMeasurer(nn.Module):
                 disp_r = delta[:, idx, :].norm(dim=-1).mean(dim=-1)   # [L]
                 speed_r = vel[:, idx, :].norm(dim=-1).mean(dim=-1)    # [L]
                 feats.append(torch.stack([disp_r, speed_r], dim=-1))  # [L, 2]
-            feats = torch.stack(feats, dim=1)                         # [L, N_REGIONS, 2]
 
-            p95 = torch.quantile(feats, self.quantile, dim=0)         # [N_REGIONS, 2]
-            z = (p95 - self.style_mean) / self.style_std              # [N_REGIONS, 2]
-            out.append(z.flatten())                                   # [N_REGIONS*2]
+            if self.include_pose:
+                # Parameter-space head-rotation metric from the decoded gpose,
+                # mirroring precompute_style_disp.py exactly.  disp is the
+                # excursion from the clip's MEAN orientation (range of motion),
+                # so a static held turn scores ~0 and a high-disp request can
+                # only be met by sustained head movement, not a single turn.
+                g_ref = gpose_b.mean(dim=0, keepdim=True)            # [1, 3] mean orientation
+                pose_disp = (gpose_b - g_ref).norm(dim=-1)          # [L]
+                gpose_shift = torch.cat([gpose_b[:1], gpose_b[:-1]], dim=0)
+                pose_speed = (gpose_b - gpose_shift).norm(dim=-1)    # speed(0)=0
+                feats.append(torch.stack([pose_disp, pose_speed], dim=-1))  # [L, 2]
 
-        return torch.stack(out, dim=0)                                # [B, N_REGIONS*2]
+            feats = torch.stack(feats, dim=1)                         # [L, n_regions, 2]
+
+            p95 = torch.quantile(feats, self.quantile, dim=0)         # [n_regions, 2]
+            if self.include_pose:
+                # Pose disp = head range of motion, aggregated as the temporal
+                # std (RMS excursion from the clip mean) over ALL frames, NOT the
+                # p95 tail.  A p95 only constrains ~5% of frames, so it is met by
+                # a single brief swing; the RMS forces the head to spend a large
+                # fraction of the clip away from centre -> sustained motion.
+                pose_exc = feats[:, N_REGIONS, 0]                     # [L]
+                p95[N_REGIONS, 0] = pose_exc.pow(2).mean().clamp_min(1e-12).sqrt()
+            z = (p95 - self.style_mean) / self.style_std              # [n_regions, 2]
+            out.append(z.flatten())                                   # [n_regions*2]
+
+        return torch.stack(out, dim=0)                                # [B, n_regions*2]

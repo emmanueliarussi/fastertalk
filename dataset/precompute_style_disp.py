@@ -51,6 +51,11 @@ from flame_model.FLAME import FLAMEModel
 # ---------------------------------------------------------------------------
 # Region definitions
 # ---------------------------------------------------------------------------
+# Vertex regions are measured as FLAME vertex displacement (expression + jaw,
+# global head pose zeroed).  Pose is different: head rotation rigidly moves the
+# whole mesh, so it cannot be captured as vertex displacement (that is exactly
+# why gpose is zeroed for the vertex regions).  Pose is therefore measured in
+# parameter space directly from the global-pose rotation vector.
 REGION_NAMES = ["lips", "forehead", "eyes"]
 _MASK_KEYS = {
     "lips":     ["lips"],
@@ -58,6 +63,10 @@ _MASK_KEYS = {
     "eyes":     ["left_eye_region", "right_eye_region"],
 }
 N_REGIONS = len(REGION_NAMES)
+
+# Pose region (rotation-based, no vertex mask). Appended after the vertex regions
+# when --include_pose is set, so the per-frame feature array gains a 4th row.
+POSE_REGION_NAME = "pose"
 
 MASKS_PATH = PROJECT_ROOT / "flame_model" / "assets" / "FLAME_masks.pkl"
 
@@ -117,7 +126,7 @@ def extract_params(npz_path: Path):
     if gpose.shape[0] != T or jaw.shape[0] != T:
         return None
 
-    return expr, jaw
+    return expr, gpose, jaw
 
 
 @torch.no_grad()
@@ -138,21 +147,34 @@ def compute_neutral_verts(flame: FLAMEModel, device: torch.device) -> torch.Tens
 def compute_disp_sequence(
     flame: FLAMEModel,
     expr_np: np.ndarray,
+    gpose_np: np.ndarray,
     jaw_np: np.ndarray,
     verts_neutral: torch.Tensor,
     region_masks: dict,
     device: torch.device,
     batch_size: int = 256,
+    include_pose: bool = True,
 ) -> np.ndarray:
     """
-    Returns per-frame per-region (disp, speed) features: (T, N_REGIONS, 2).
+    Returns per-frame per-region (disp, speed) features: (T, N_out, 2),
+    where N_out = N_REGIONS (+1 when include_pose).
 
+    Vertex regions (lips, forehead, eyes), measured on the FLAME mesh with the
+    global head pose zeroed:
       disp(t)  = mean_{v in M_r} || verts(t,v) - verts_neutral(v) ||_2
       speed(t) = mean_{v in M_r} || verts(t,v) - verts(t-1,v)     ||_2
       speed(0) = 0
+
+    Pose region (optional, last row), measured in parameter space from the
+    global-pose rotation vector (head rotation rigidly moves the whole mesh,
+    so it cannot be captured as vertex displacement):
+      disp(t)  = || gpose(t) ||_2            (rotation angle from frontal)
+      speed(t) = || gpose(t) - gpose(t-1) ||_2
+      speed(0) = 0
     """
     T = expr_np.shape[0]
-    out = np.zeros((T, N_REGIONS, 2), dtype=np.float32)
+    n_out = N_REGIONS + (1 if include_pose else 0)
+    out = np.zeros((T, n_out, 2), dtype=np.float32)
 
     shape_zeros = torch.zeros(1, 300, device=device)
     eye_zeros = torch.zeros(1, 6, device=device)
@@ -210,6 +232,22 @@ def compute_disp_sequence(
 
         prev_verts = verts[-1].detach()  # (V, 3)
 
+    # --- Pose region: rotation magnitude / angular speed from gpose params ---
+    if include_pose:
+        g = gpose_np.astype(np.float32)                         # (T, 3)
+        # disp = excursion from the clip's MEAN head orientation (range of
+        # motion), NOT distance from frontal.  A static held turn would maximise
+        # ||gpose|| while doing no motion ("turn once and hold"), which p95 over
+        # the clip happily accepts; subtracting the clip mean makes a held offset
+        # score ~0, so a high disp request can only be met by the head actually
+        # moving over a large angular range.
+        g_ref = g.mean(axis=0, keepdims=True)                   # (1, 3) mean orientation
+        pose_disp = np.linalg.norm(g - g_ref, axis=-1)         # excursion from mean
+        pose_speed = np.zeros(T, dtype=np.float32)
+        pose_speed[1:] = np.linalg.norm(g[1:] - g[:-1], axis=-1)
+        out[:, N_REGIONS, 0] = pose_disp
+        out[:, N_REGIONS, 1] = pose_speed
+
     return out
 
 
@@ -244,6 +282,10 @@ def main():
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--overwrite", action="store_true",
                         help="Recompute even when a sidecar already exists.")
+    parser.add_argument("--include_pose", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Append a 'pose' region (head-rotation disp/speed). "
+                             "Use --no-include_pose to disable.")
     args = parser.parse_args()
 
     data_root  = Path(args.data_root)
@@ -280,6 +322,9 @@ def main():
     npz_files = sorted(npz_root.rglob("*.npz"))
     print(f"Found {len(npz_files)} .npz files\n")
 
+    out_region_names = REGION_NAMES + ([POSE_REGION_NAME] if args.include_pose else [])
+    print(f"Regions: {out_region_names}\n")
+
     # -----------------------------------------------------------------------
     # Pass 1: compute and save per-file sidecars
     # -----------------------------------------------------------------------
@@ -301,12 +346,13 @@ def main():
             n_failed += 1
             continue
 
-        expr_np, jaw_np = params
+        expr_np, gpose_np, jaw_np = params
         try:
             disp = compute_disp_sequence(
-                flame, expr_np, jaw_np,
+                flame, expr_np, gpose_np, jaw_np,
                 verts_neutral, region_masks, device,
                 batch_size=args.batch_size,
+                include_pose=args.include_pose,
             )
             np.save(sidecar, disp)
             n_done += 1
@@ -335,8 +381,15 @@ def main():
             end = min(T, start + MAX_SEQ_LEN)
             if (end - start) < MIN_SEQ_LEN:
                 continue
-            chunk = feats[start:end]                              # (L, N_REGIONS, 2)
-            p95_list.append(np.percentile(chunk, 95, axis=0))     # (N_REGIONS, 2)
+            chunk = feats[start:end]                              # (L, N_out, 2)
+            stat = np.percentile(chunk, 95, axis=0)               # (N_out, 2)
+            if args.include_pose:
+                # Pose disp = head range of motion: temporal std (RMS excursion
+                # from the clip mean) over ALL frames, not the p95 tail, so a
+                # single brief swing cannot satisfy a high-disp request.
+                pose_exc = chunk[:, N_REGIONS, 0]
+                stat[N_REGIONS, 0] = np.sqrt(np.mean(pose_exc ** 2))
+            p95_list.append(stat)                                 # (N_out, 2)
 
     if not p95_list:
         print("Warning: no training chunks found — stats file not written.")
@@ -351,14 +404,14 @@ def main():
         stats_path,
         mean=mean,
         std=std,
-        region_names=np.array(REGION_NAMES),
+        region_names=np.array(out_region_names),
         feature_names=np.array(["disp", "speed"]),
     )
 
     print(f"\nStats saved → {stats_path}")
     print(f"{'Region':<12}  {'feat':<6}  {'mean':>12}  {'std':>12}")
     print("-" * 46)
-    for i, name in enumerate(REGION_NAMES):
+    for i, name in enumerate(out_region_names):
         for j, feat in enumerate(["disp", "speed"]):
             print(f"{name:<12}  {feat:<6}  {mean[i, j]:>12.6f}  {std[i, j]:>12.6f}")
 
