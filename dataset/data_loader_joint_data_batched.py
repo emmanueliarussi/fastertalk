@@ -17,20 +17,26 @@ N_VERTEX_REGIONS = 3
 
 
 class BlendshapeDataset(data.Dataset):
-    def __init__(self, items, augmentor=None, style_mean=None, style_std=None):
+    def __init__(self, items, augmentor=None, style_mean=None, style_std=None,
+                 read_audio=False):
         """
         items       : list of (blendshapes_chunk np.ndarray [T,58],
-                               style_disp_chunk  np.ndarray [T, N_REGIONS, 2] or None)
+                               style_disp_chunk  np.ndarray [T, N_REGIONS, 2] or None,
+                               [audio_chunk np.ndarray [N] when read_audio])
         style_mean  : np.ndarray [N_REGIONS, 2] or None  (z-score stats)
         style_std   : np.ndarray [N_REGIONS, 2] or None
+        read_audio  : if True, __getitem__ also returns the per-chunk waveform.
         """
         self.items       = items
         self.augmentor   = augmentor
         self.style_mean  = style_mean
         self.style_std   = style_std
+        self.read_audio  = read_audio
 
     def __getitem__(self, index):
-        blendshapes, disp = self.items[index]
+        item = self.items[index]
+        blendshapes, disp = item[0], item[1]
+        audio = item[2] if (self.read_audio and len(item) > 2) else None
         if self.augmentor is not None:
             seed = (index * 2654435761) & 0xFFFFFFFF
             rng  = np.random.default_rng(seed ^ np.random.randint(0, 2**31))
@@ -64,6 +70,16 @@ class BlendshapeDataset(data.Dataset):
             else:
                 n_style = 6
             style = torch.zeros(n_style, dtype=torch.float32)
+
+        if self.read_audio:
+            audio_t = torch.from_numpy(np.asarray(audio, dtype=np.float32)) \
+                if audio is not None else torch.zeros(0, dtype=torch.float32)
+            return (
+                torch.from_numpy(inp).float(),         # augmented input
+                torch.from_numpy(blendshapes).float(), # clean target
+                style,                                 # style conditioning
+                audio_t,                               # (N,) raw waveform samples
+            )
 
         return (
             torch.from_numpy(inp).float(),        # augmented input
@@ -173,6 +189,19 @@ def read_data(args):
     print("Train lines read:", len(train_wavs))
     print("Test lines read:", len(test_wavs))
 
+    # Optional audio loading (stage2). Only imported/instantiated when requested
+    # so the stage1 path keeps zero audio dependencies.
+    read_audio = bool(getattr(args, "read_audio", False))
+    audio_processor = None
+    if read_audio:
+        import librosa  # noqa: F401  (kept local to avoid a hard dep for stage1)
+        from transformers import Wav2Vec2FeatureExtractor
+
+        audio_processor = Wav2Vec2FeatureExtractor.from_pretrained(args.wav2vec2model_path)
+        print("Audio loading ENABLED — processor: {}".format(args.wav2vec2model_path))
+    # Raw samples per motion frame: 16 kHz audio / 25 fps motion = 640.
+    SAMPLES_PER_FRAME = 640
+
     max_seq_len = int(getattr(args, "max_seq_len", 600))
     min_seq_len = int(getattr(args, "min_seq_len", 8))
 
@@ -205,6 +234,19 @@ def read_data(args):
         if blendshapes is None or blendshapes.shape[0] < min_seq_len:
             continue
 
+        # Load matching waveform (stage2 only). Skip the file if audio is
+        # required but missing so we never emit audio-less stage2 items.
+        audio_feats = None
+        if read_audio:
+            wav_path = audio_path / wav_name
+            if not wav_path.exists():
+                continue
+            import librosa
+            speech, _ = librosa.load(str(wav_path), sr=16000)
+            audio_feats = np.squeeze(
+                audio_processor(speech, sampling_rate=16000).input_values
+            ).astype(np.float32)
+
         # Load matching style displacement sidecar (optional).
         rel          = npz_path.relative_to(npz_root)
         sidecar_path = (annot_root / rel).with_suffix(".style_disp.npy")
@@ -224,7 +266,11 @@ def read_data(args):
                 continue
             chunk_bs   = blendshapes[start:end]
             chunk_disp = disp_full[start:end] if disp_full is not None else None
-            item = (chunk_bs, chunk_disp)
+            if read_audio:
+                chunk_audio = audio_feats[start * SAMPLES_PER_FRAME:end * SAMPLES_PER_FRAME]
+                item = (chunk_bs, chunk_disp, chunk_audio)
+            else:
+                item = (chunk_bs, chunk_disp)
             if wav_name in train_wavs:
                 train_items.append(item)
             else:
@@ -273,22 +319,58 @@ def collate_fn(batch):
     return padded_in, padded_tgt, mask, style_batch
 
 
+def collate_fn_audio(batch):
+    # batch: list of (input, target, style, audio[N]) — stage2 path.
+    batch = sorted(batch, key=lambda item: item[0].shape[0], reverse=True)
+    inputs  = [item[0] for item in batch]
+    targets = [item[1] for item in batch]
+    styles  = [item[2] for item in batch]
+    audios  = [item[3] for item in batch]
+    lengths = [t.shape[0] for t in inputs]
+
+    padded_in  = pad_sequence(inputs,  batch_first=True, padding_value=0.0)
+    padded_tgt = pad_sequence(targets, batch_first=True, padding_value=0.0)
+    style_batch = torch.stack(styles, dim=0)
+    mask = torch.zeros(padded_in.shape[:2], dtype=torch.bool)
+    for i, length in enumerate(lengths):
+        mask[i, :length] = True
+
+    audio_lengths = [a.shape[-1] for a in audios]
+    max_audio_len = max(audio_lengths) if audio_lengths else 0
+    padded_audios = torch.zeros((len(audios), 1, max_audio_len))
+    audio_mask    = torch.zeros((len(audios), max_audio_len), dtype=torch.long)
+    for i, a in enumerate(audios):
+        l = int(a.shape[-1])
+        padded_audios[i, 0, :l] = a
+        audio_mask[i, :l] = 1
+
+    return padded_in, padded_tgt, mask, style_batch, padded_audios, audio_mask
+
+
 def get_dataloaders(args):
     train_items, valid_items, test_items, style_mean, style_std = read_data(args)
 
-    train_augmentor = build_augmentor_from_cfg(args)
+    read_audio = bool(getattr(args, "read_audio", False))
+    # Stage2 (audio) uses the clean target motion for teacher forcing, so input
+    # corruption is disabled; augmentation stays a stage1-only feature.
+    train_augmentor = None if read_audio else build_augmentor_from_cfg(args)
     if train_augmentor is not None:
         print("Data augmentation enabled for training (input-only corruption).")
     else:
         print("Data augmentation disabled.")
 
+    collate = collate_fn_audio if read_audio else collate_fn
+
     datasets = {
         "train": BlendshapeDataset(train_items, augmentor=train_augmentor,
-                                   style_mean=style_mean, style_std=style_std),
+                                   style_mean=style_mean, style_std=style_std,
+                                   read_audio=read_audio),
         "valid": BlendshapeDataset(valid_items, augmentor=None,
-                                   style_mean=style_mean, style_std=style_std),
+                                   style_mean=style_mean, style_std=style_std,
+                                   read_audio=read_audio),
         "test":  BlendshapeDataset(test_items,  augmentor=None,
-                                   style_mean=style_mean, style_std=style_std),
+                                   style_mean=style_mean, style_std=style_std,
+                                   read_audio=read_audio),
     }
 
     workers = int(getattr(args, "workers", 4))
@@ -301,7 +383,7 @@ def get_dataloaders(args):
             shuffle=True,
             num_workers=workers,
             drop_last=True,
-            collate_fn=collate_fn,
+            collate_fn=collate,
         ),
         "valid": data.DataLoader(
             datasets["valid"],
@@ -309,7 +391,7 @@ def get_dataloaders(args):
             shuffle=False,
             num_workers=workers,
             drop_last=False,
-            collate_fn=collate_fn,
+            collate_fn=collate,
         ),
         "test": data.DataLoader(
             datasets["test"],
@@ -317,7 +399,7 @@ def get_dataloaders(args):
             shuffle=False,
             num_workers=workers,
             drop_last=False,
-            collate_fn=collate_fn,
+            collate_fn=collate,
         ),
     }
 

@@ -1,0 +1,74 @@
+DATA:
+  dataset: TalkingHead-1KH
+  data_root: /mnt/Datasets/ARTalk_data
+  vertices_path: npz
+  wav_path: wav
+  read_audio: true
+  train_subjects: English
+  val_subjects: English
+  test_subjects: English
+  max_seq_len: 600
+  min_seq_len: 8
+
+LOSS:
+  loss: MSE
+  # Velocity / delta loss weight: penalises static motion (anti-collapse).
+  blendshape_delta_weight: 1.0e-1
+  # Channels excluded from the velocity term (gpose+jaw = indices 50:56).
+  pose_start_idx: 50
+  pose_dim: 6
+
+NETWORK:
+  # Stage-2 predictor architecture selector.
+  arch: stage2
+  # --- Stage-1 (frozen autoencoder) architecture: MUST match the checkpoint in
+  #     vqvae_pretrained_path so StyleVQAutoEncoder.load_state_dict succeeds. ---
+  in_dim: 58
+  hidden_size: 512
+  num_hidden_layers: 6
+  num_attention_heads: 8
+  style_dim: 32
+  n_style_scalars: 8
+  style_time_varying: false
+  style_time_dim: 16
+  style_film_smooth_win: 3
+
+VQuantizer:
+  n_embed: 2048
+
+PREDICTOR:
+  feature_dim: 1024
+  blendshapes_dim: 58
+  device: cuda
+  period: 25
+  num_layers: 4
+  n_head: 4
+  # Option A: fine-tune the audio encoder (matches the working recipe). The delta
+  # loss is what prevents collapse now, so the encoder can adapt to lip-sync.
+  freeze_audio_encoder: false
+  # HuBERT/Wav2Vec2 audio backbone (mHuBERT-147).
+  wav2vec2model_path: utter-project/mHuBERT-147
+  # Frozen stage-1 (8-dim style) checkpoint that defines the target codebook.
+  vqvae_pretrained_path: /mnt/fastertalk/logs/stage1_style/checkpoints/epoch_300.pt
+
+TRAIN:
+  workers: 8
+  batch_size: 8
+  base_lr: 1.0e-5
+  weight_decay: 0.002
+  epochs: 300
+  step_size: 100
+  gamma: 0.5
+  manual_seed: 131
+  print_freq: 10
+  save_freq: 5
+  eval_freq: 5
+  evaluate: true
+  # Free-running collapse probe: rollouts at eval cadence (0 disables).
+  collapse_probe_clips: 4
+  save_path: /mnt/fastertalk/logs/stage2/checkpoints
+  log_dir: /mnt/fastertalk/logs/stage2
+  wandb: true
+  wandb_project: fastertalk_stage2
+  wandb_run_name: fastertalk-stage2-scratch
+  wandb_mode: online

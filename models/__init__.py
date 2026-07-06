@@ -8,4 +8,7 @@ def get_model(cfg):
         return VQAutoEncoder(cfg)
     if arch == "stage1_style":
         return StyleVQAutoEncoder(cfg)
+    if arch == "stage2":
+        from .stage2 import FasterTalk
+        return FasterTalk(cfg)
     raise ValueError(f"Unsupported arch '{arch}'.")
